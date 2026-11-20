@@ -1,11 +1,13 @@
 """端到端测试：首次提交、整批替换核查、井归属重算、并发与崩溃原子性。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 
 import pytest
 from fastapi.testclient import TestClient
+from shapely.geometry import shape
 
 from app.main import app
 
@@ -382,3 +384,445 @@ def test_current_is_one_consistent_version(env):
     # 同一响应里边界与井归属同版
     assert {w["id"] for w in current["wells"]} == {"W-in", "W-edge", "W-out", "W-move"}
     assert {p["id"] for p in current["parcels"]} == {"P1", "P2"}
+
+
+# ---------------------------------------------------------------- 扩区
+
+NEIGHBOR = square(100, 0, 200, 100)   # 东侧邻区，与 REGION 共边 x=100
+P3 = square(100, 0, 150, 100)
+P4 = square(150, 0, 200, 100)
+
+# 原区域外沿（x=100）上的井：扩区后该边变成内部共边
+EXPAND_WELLS = WELLS + [{"id": "W-rim", "geometry": point(100, 50)}]
+
+NEW_WELLS = [
+    {"id": "W-new-in", "geometry": point(125, 50)},     # 邻区内部（P3）
+    {"id": "W-new-edge", "geometry": point(100, 25)},   # 落在共边上（允许）
+    {"id": "W-new-outer", "geometry": point(200, 50)},  # 邻区外沿（允许）
+]
+
+
+def init_for_expand(client):
+    r = client.post("/v1/init", json={
+        "region": REGION,
+        "parcels": [{"id": "P1", "geometry": P1}, {"id": "P2", "geometry": P2}],
+        "wells": EXPAND_WELLS,
+    })
+    assert r.status_code == 201, r.text
+
+
+def expand_payload(**over):
+    body = {
+        "base_revision": 1,
+        "region": NEIGHBOR,
+        "parcels": [{"id": "P3", "geometry": P3}, {"id": "P4", "geometry": P4}],
+        "wells": NEW_WELLS,
+    }
+    body.update(over)
+    return body
+
+
+def expand_ok(client, **over):
+    r = client.post("/v1/expand", json=expand_payload(**over))
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def same_region(actual, expected):
+    """几何等价（忽略起点/绕向/union 保留的共线顶点）。"""
+    return shape(actual).equals(shape(expected))
+
+
+def test_expand_success_merges_and_recomputes(env):
+    client, _ = env
+    init_for_expand(client)
+
+    body = expand_ok(client)
+    assert body["revision"] == 2
+    assert body["parcel_count"] == 4
+    assert body["well_count"] == 8
+    assert body["well_summary"] == {"assigned": 3, "pending": 5, "uncovered": 0}
+
+    current = client.get("/v1/current").json()
+    assert current["revision"] == 2
+    # 新范围 = 拼接后的单环区域
+    assert same_region(current["region"], square(0, 0, 200, 100))
+    assert {p["id"] for p in current["parcels"]} == {"P1", "P2", "P3", "P4"}
+
+    wells = wells_by_id(current)
+    assert wells["W-in"]["parcel_id"] == "P1"
+    # 原外沿井按拼接后的宗地列全候选
+    assert wells["W-rim"]["status"] == "pending"
+    assert wells["W-rim"]["candidates"] == ["P2", "P3"]
+    # 原区域外的井落入邻区宗地共边 → pending 并列全候选
+    assert wells["W-out"]["status"] == "pending"
+    assert wells["W-out"]["candidates"] == ["P3", "P4"]
+    # 新井归属
+    assert wells["W-new-in"]["status"] == "assigned"
+    assert wells["W-new-in"]["parcel_id"] == "P3"
+    assert wells["W-new-edge"]["candidates"] == ["P2", "P3"]
+    assert wells["W-new-outer"]["candidates"] == ["P4"]
+
+    # 历史修订仍返回当时的区域、宗地、井和归属
+    old = client.get("/v1/revisions/1").json()
+    assert same_region(old["region"], REGION)
+    assert {p["id"] for p in old["parcels"]} == {"P1", "P2"}
+    old_wells = wells_by_id(old)
+    assert set(old_wells) == {"W-in", "W-edge", "W-out", "W-move", "W-rim"}
+    assert old_wells["W-rim"]["candidates"] == ["P2"]       # 当时只是外沿
+    assert old_wells["W-out"]["status"] == "uncovered"      # 当时在区域外
+
+
+def test_expand_before_init_404(env):
+    client, _ = env
+    r = client.post("/v1/expand", json=expand_payload())
+    assert r.status_code == 404
+    assert r.json()["detail"]["error"] == "not_initialized"
+
+
+def test_expand_region_relationship_rules(env):
+    client, _ = env
+    init_ok(client)
+
+    # 内部重叠
+    r = client.post("/v1/expand", json=expand_payload(region=square(50, 0, 150, 100)))
+    assert r.status_code == 422
+    codes = {x["code"] for x in r.json()["detail"]["reasons"]}
+    assert "region_overlap" in codes
+
+    # 仅共点（东北角 (100,100)），不算共边
+    r = client.post("/v1/expand", json=expand_payload(region=square(100, 100, 200, 200)))
+    assert r.status_code == 422
+    codes = {x["code"] for x in r.json()["detail"]["reasons"]}
+    assert "no_shared_edge" in codes
+
+    # 完全相离
+    r = client.post("/v1/expand", json=expand_payload(region=square(300, 0, 400, 100)))
+    assert r.status_code == 422
+    codes = {x["code"] for x in r.json()["detail"]["reasons"]}
+    assert "no_shared_edge" in codes
+
+    # 全部失败：当前版本不变
+    assert client.get("/v1/current").json()["revision"] == 1
+
+
+def test_expand_merged_region_with_hole_rejected(env):
+    """C 形邻区与当前区域拼接后围出洞 → 拒绝。"""
+    client, _ = env
+    init_ok(client)
+    c_shape = {"type": "Polygon", "coordinates": [[
+        [100, 0], [200, 0], [200, 100], [100, 100],
+        [100, 75], [150, 75], [150, 25], [100, 25],
+        [100, 0],
+    ]]}
+    c_parcels = [   # 恰好铺满 C 形（缺口朝西，被当前区域围成洞）
+        {"id": "P3", "geometry": square(150, 0, 200, 100)},
+        {"id": "P4", "geometry": square(100, 0, 150, 25)},
+        {"id": "P5", "geometry": square(100, 75, 150, 100)},
+    ]
+    r = client.post("/v1/expand", json=expand_payload(
+        region=c_shape, parcels=c_parcels, wells=[]))
+    assert r.status_code == 422
+    codes = {x["code"] for x in r.json()["detail"]["reasons"]}
+    assert codes == {"merged_region_invalid"}
+    assert client.get("/v1/current").json()["revision"] == 1
+
+
+def test_expand_parcels_must_tile_neighbor(env):
+    client, _ = env
+    init_ok(client)
+
+    # 邻区宗地留空缺
+    r = client.post("/v1/expand", json=expand_payload(
+        parcels=[{"id": "P3", "geometry": P3},
+                 {"id": "P4", "geometry": square(150, 0, 190, 100)}]))
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["gap_area"] == pytest.approx(1000.0)
+    assert any(x["code"] == "gap" for x in detail["reasons"])
+
+    # 邻区宗地内部重叠
+    r = client.post("/v1/expand", json=expand_payload(
+        parcels=[{"id": "P3", "geometry": square(100, 0, 160, 100)},
+                 {"id": "P4", "geometry": square(140, 0, 200, 100)}]))
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["overlap_parcel_ids"] == ["P3", "P4"]
+
+    assert client.get("/v1/current").json()["revision"] == 1
+
+
+def test_expand_well_must_be_in_neighbor(env):
+    client, _ = env
+    init_ok(client)
+    r = client.post("/v1/expand", json=expand_payload(
+        wells=[{"id": "W-far", "geometry": point(500, 50)}]))
+    assert r.status_code == 422
+    codes = {x["code"] for x in r.json()["detail"]["reasons"]}
+    assert "well_outside_region" in codes
+    assert client.get("/v1/current").json()["revision"] == 1
+
+
+def test_expand_duplicate_ids_rejected(env):
+    client, _ = env
+    init_ok(client)
+
+    # 与现有宗地编号冲突
+    r = client.post("/v1/expand", json=expand_payload(
+        parcels=[{"id": "P1", "geometry": P3}, {"id": "P4", "geometry": P4}]))
+    assert r.status_code == 422
+    assert any(x["code"] == "duplicate_parcel_id" for x in r.json()["detail"]["reasons"])
+
+    # 与现有井编号冲突
+    r = client.post("/v1/expand", json=expand_payload(
+        wells=[{"id": "W-in", "geometry": point(125, 50)}]))
+    assert r.status_code == 422
+    assert any(x["code"] == "duplicate_well_id" for x in r.json()["detail"]["reasons"])
+
+    # 请求内重复
+    r = client.post("/v1/expand", json=expand_payload(
+        parcels=[{"id": "P3", "geometry": P3}, {"id": "P3", "geometry": P4}]))
+    assert r.status_code == 422
+    assert any(x["code"] == "duplicate_parcel_id" for x in r.json()["detail"]["reasons"])
+
+    assert client.get("/v1/current").json()["revision"] == 1
+
+
+def test_expand_merged_limits(env):
+    client, _ = env
+    init_ok(client)   # 2 宗地、4 口井
+
+    # 39 块新宗地（单次未超 40），合并后 41 > 40
+    parcels = [{"id": f"N{i}", "geometry": square(100 + i, 0, 101 + i, 100)}
+               for i in range(39)]
+    r = client.post("/v1/expand", json={
+        "base_revision": 1, "region": square(100, 0, 139, 100), "parcels": parcels})
+    assert r.status_code == 422
+    assert any(x["code"] == "too_many_parcels" for x in r.json()["detail"]["reasons"])
+
+    # 97 口新井（单次未超 100），合并后 101 > 100
+    wells = [{"id": f"X{i}", "geometry": point(125, 50)} for i in range(97)]
+    r = client.post("/v1/expand", json=expand_payload(wells=wells))
+    assert r.status_code == 422
+    assert any(x["code"] == "too_many_wells" for x in r.json()["detail"]["reasons"])
+
+    assert client.get("/v1/current").json()["revision"] == 1
+
+
+def test_expand_stale_base_revision(env):
+    client, _ = env
+    init_ok(client)
+    expand_ok(client)   # → v2
+    r = client.post("/v1/expand", json=expand_payload(
+        base_revision=1, region=square(0, 100, 200, 200),
+        parcels=[{"id": "P5", "geometry": square(0, 100, 100, 200)},
+                 {"id": "P6", "geometry": square(100, 100, 200, 200)}]))
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["error"] == "revision_conflict" and detail["current_revision"] == 2
+
+
+def test_expand_can_repeat_and_history_kept(env):
+    """扩区可多次提交；各历史修订仍返回当时的范围。"""
+    client, _ = env
+    init_ok(client)
+    expand_ok(client)   # v2：东侧邻区
+
+    r = client.post("/v1/expand", json={
+        "base_revision": 2,
+        "region": square(0, 100, 200, 200),   # 北侧邻区，与合并后范围共边 y=100
+        "parcels": [{"id": "P5", "geometry": square(0, 100, 100, 200)},
+                    {"id": "P6", "geometry": square(100, 100, 200, 200)}],
+        "wells": [{"id": "W-top", "geometry": point(50, 150)}],
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["revision"] == 3
+
+    current = client.get("/v1/current").json()
+    assert same_region(current["region"], square(0, 0, 200, 200))
+    assert {p["id"] for p in current["parcels"]} == {"P1", "P2", "P3", "P4", "P5", "P6"}
+    assert wells_by_id(current)["W-top"]["parcel_id"] == "P5"
+
+    # 各历史修订的范围各不相同、均为当时范围
+    v1 = client.get("/v1/revisions/1").json()
+    assert same_region(v1["region"], REGION)
+    assert {w["id"] for w in v1["wells"]} == {"W-in", "W-edge", "W-out", "W-move"}
+    v2 = client.get("/v1/revisions/2").json()
+    assert same_region(v2["region"], square(0, 0, 200, 100))
+    assert "W-top" not in {w["id"] for w in v2["wells"]}
+
+
+def test_replace_after_expand_uses_merged_region_and_all_wells(env):
+    """扩区后的常规改图：按当前（拼接后）范围核查，并按全体井重算。"""
+    client, _ = env
+    init_for_expand(client)
+    expand_ok(client)   # v2
+
+    # 把 P3/P4 的共边从 x=150 移到 x=160（扩区来的宗地同样可改）
+    r = client.put("/v1/parcels", json={
+        "base_revision": 2,
+        "parcels": [{"id": "P3", "geometry": square(100, 0, 160, 100)},
+                    {"id": "P4", "geometry": square(160, 0, 200, 100)}],
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["revision"] == 3
+
+    current = client.get("/v1/current").json()
+    assert same_region(current["region"], square(0, 0, 200, 100))  # 范围保持拼接后
+    wells = wells_by_id(current)
+    assert wells["W-out"]["status"] == "assigned"      # x=150 进入 P3 内部
+    assert wells["W-out"]["parcel_id"] == "P3"
+    assert wells["W-new-in"]["parcel_id"] == "P3"      # 扩区新井也参与重算
+    assert wells["W-rim"]["candidates"] == ["P2", "P3"]
+
+    # 改图不能超出拼接后的范围
+    r = client.put("/v1/parcels", json={
+        "base_revision": 3,
+        "parcels": [{"id": "P4", "geometry": square(160, 0, 210, 100)}],
+    })
+    assert r.status_code == 422
+    assert "outside_region" in {x["code"] for x in r.json()["detail"]["reasons"]}
+
+
+def test_concurrent_expand_only_one_wins(env):
+    """同版并发扩区：恰好一份成功。"""
+    client, _ = env
+    init_ok(client)
+
+    results = []
+
+    def worker(c):
+        r = c.post("/v1/expand", json=expand_payload(wells=[]))
+        results.append(r.status_code)
+
+    with TestClient(app) as c1, TestClient(app) as c2:
+        barrier = threading.Barrier(2)
+
+        def run(c):
+            barrier.wait()
+            worker(c)
+
+        t1 = threading.Thread(target=run, args=(c1,))
+        t2 = threading.Thread(target=run, args=(c2,))
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert sorted(results) == [201, 409], results
+    assert client.get("/v1/current").json()["revision"] == 2
+    rows = client.get("/v1/revisions").json()["revisions"]
+    assert [r["revision"] for r in rows] == [1, 2]
+
+
+def test_expand_failed_commit_rolls_back(env, monkeypatch):
+    """扩区提交中途崩溃：新范围、新宗地、新井整批不生效。"""
+    client, db = env
+    init_ok(client)
+
+    import app.main as main_mod
+
+    original = main_mod._insert_version
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash mid-commit")
+
+    monkeypatch.setattr(main_mod, "_insert_version", boom)
+    r = client.post("/v1/expand", json=expand_payload())
+    assert r.status_code == 500
+    monkeypatch.setattr(main_mod, "_insert_version", original)
+
+    assert client.get("/v1/current").json()["revision"] == 1
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM region_versions").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM parcels WHERE revision > 1").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM wells WHERE well_id LIKE 'W-new-%'").fetchone()[0] == 0
+        assert conn.execute("SELECT current_revision FROM meta").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    # 崩溃后服务照常可用，扩区可重试
+    assert expand_ok(client)["revision"] == 2
+
+
+# ---------------------------------------------------------------- 旧库续用
+
+# 扩区功能上线前的旧库结构（区域只有一份、不可变）
+OLD_SCHEMA = """
+CREATE TABLE meta (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    current_revision INTEGER NOT NULL
+);
+CREATE TABLE versions (
+    revision     INTEGER PRIMARY KEY,
+    created_at   TEXT NOT NULL,
+    parcel_count INTEGER NOT NULL,
+    well_count   INTEGER NOT NULL
+);
+CREATE TABLE regions (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    geojson TEXT NOT NULL
+);
+CREATE TABLE wells (
+    well_id TEXT PRIMARY KEY,
+    geojson TEXT NOT NULL
+);
+CREATE TABLE parcels (
+    revision  INTEGER NOT NULL REFERENCES versions(revision),
+    parcel_id TEXT NOT NULL,
+    geojson   TEXT NOT NULL,
+    PRIMARY KEY (revision, parcel_id)
+);
+CREATE TABLE well_attributions (
+    revision  INTEGER NOT NULL REFERENCES versions(revision),
+    well_id   TEXT NOT NULL REFERENCES wells(well_id),
+    status    TEXT NOT NULL CHECK (status IN ('assigned', 'pending', 'uncovered')),
+    parcel_id TEXT,
+    candidates TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (revision, well_id)
+);
+"""
+
+
+def test_existing_db_reused_after_upgrade(tmp_path, monkeypatch):
+    """已有旧库直接续用：启动迁移后查询格式不变，可直接扩区。"""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(OLD_SCHEMA)
+        conn.execute("INSERT INTO meta VALUES (1, 1)")
+        conn.execute("INSERT INTO versions VALUES (1, '2026-01-01T00:00:00+00:00', 2, 1)")
+        conn.execute("INSERT INTO regions VALUES (1, ?)", (json.dumps(REGION),))
+        conn.execute("INSERT INTO wells VALUES ('W1', ?)", (json.dumps(point(25, 50)),))
+        conn.execute("INSERT INTO parcels VALUES (1, 'P1', ?)", (json.dumps(P1),))
+        conn.execute("INSERT INTO parcels VALUES (1, 'P2', ?)", (json.dumps(P2),))
+        conn.execute("INSERT INTO well_attributions VALUES (1, 'W1', 'assigned', 'P1', '[\"P1\"]')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db))
+    with TestClient(app) as client:
+        # 迁移后旧数据按原查询格式可读
+        current = client.get("/v1/current").json()
+        assert current["revision"] == 1
+        assert same_region(current["region"], REGION)
+        assert {p["id"] for p in current["parcels"]} == {"P1", "P2"}
+        assert wells_by_id(current)["W1"]["parcel_id"] == "P1"
+
+        # 旧库可直接扩区
+        r = client.post("/v1/expand", json={
+            "base_revision": 1,
+            "region": NEIGHBOR,
+            "parcels": [{"id": "P3", "geometry": P3}, {"id": "P4", "geometry": P4}],
+            "wells": [{"id": "W2", "geometry": point(125, 50)}],
+        })
+        assert r.status_code == 201, r.text
+        assert r.json()["revision"] == 2
+
+        # 历史修订仍返回当时的区域、宗地、井和归属
+        old = client.get("/v1/revisions/1").json()
+        assert same_region(old["region"], REGION)
+        assert {w["id"] for w in old["wells"]} == {"W1"}
+        now = client.get("/v1/current").json()
+        assert {w["id"] for w in now["wells"]} == {"W1", "W2"}

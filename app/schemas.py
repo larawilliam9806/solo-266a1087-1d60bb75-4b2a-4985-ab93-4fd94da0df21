@@ -43,3 +43,15 @@ class ReplaceRequest(BaseModel):
     """整批替换指定宗地：携带所见修订号 + 这些宗地的完整新边界。"""
     base_revision: int = Field(ge=1)
     parcels: list[ParcelIn] = Field(min_length=1, max_length=MAX_PARCELS)
+
+
+class ExpandRequest(BaseModel):
+    """扩区：所见修订号 + 邻区边界 + 邻区宗地 + 该区新井。
+
+    合并后（现有 + 新增）宗地总数不得超过 MAX_PARCELS、井总数不得超过
+    MAX_WELLS，合并后的编号唯一性、拼接与覆盖核查在 geo.py / main.py 中做。
+    """
+    base_revision: int = Field(ge=1)
+    region: dict[str, Any]
+    parcels: list[ParcelIn] = Field(min_length=1, max_length=MAX_PARCELS)
+    wells: list[WellIn] = Field(default_factory=list, max_length=MAX_WELLS)

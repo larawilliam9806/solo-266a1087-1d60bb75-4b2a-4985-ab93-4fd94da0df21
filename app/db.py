@@ -2,7 +2,7 @@
 
 设计要点：
 - WAL 模式 + busy_timeout：多读单写，写者排队而不是立即报 SQLITE_BUSY。
-- 每个版本（region 不可变、parcels、well_attributions、meta 指针）在
+- 每个版本（region_versions、parcels、well_attributions、meta 指针）在
   同一个事务里写入，COMMIT 之前对任何读者都不可见 —— 失败或进程被杀
   时 SQLite 自动回滚，不会留下"半版"。
 - meta.current_revision 是唯一的版本指针；发布时用
@@ -29,13 +29,20 @@ CREATE TABLE IF NOT EXISTS versions (
     well_count   INTEGER NOT NULL
 );
 
--- 区域在首次提交后不可变，只存一份。
+-- 初始区域（legacy，扩区功能上线前的唯一区域记录，仅用于迁移回填）。
 CREATE TABLE IF NOT EXISTS regions (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     geojson TEXT NOT NULL
 );
 
--- 井的几何在首次提交后不可变，归属按版本重算。
+-- 区域随扩区演进：每个版本存一份当时的监测范围，历史修订按当时区域查数。
+CREATE TABLE IF NOT EXISTS region_versions (
+    revision INTEGER NOT NULL REFERENCES versions(revision),
+    geojson  TEXT NOT NULL,
+    PRIMARY KEY (revision)
+);
+
+-- 井的几何不可变（扩区只增不改），每版有哪些井由 well_attributions 派生。
 CREATE TABLE IF NOT EXISTS wells (
     well_id TEXT PRIMARY KEY,
     geojson TEXT NOT NULL
@@ -79,7 +86,7 @@ def connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """建表，并防御性清理可能残留的未提交版本数据。
+    """建表、迁移旧库，并防御性清理可能残留的未提交版本数据。
 
     正常路径下所有写都在单事务内完成，崩溃即回滚，下面的 DELETE 应当
     永远是 no-op；保留它作为"重启不留半版"的双保险。
@@ -94,10 +101,28 @@ def init_db() -> None:
             try:
                 conn.execute("DELETE FROM well_attributions WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM parcels WHERE revision > ?", (current,))
+                conn.execute("DELETE FROM region_versions WHERE revision > ?", (current,))
                 conn.execute("DELETE FROM versions WHERE revision > ?", (current,))
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        _migrate_region_versions(conn)
     finally:
         conn.close()
+
+
+def _migrate_region_versions(conn: sqlite3.Connection) -> None:
+    """旧库只有一份不可变区域（regions 表）：为既有各版本回填当时范围。
+
+    扩区功能上线前区域不可变，因此旧库每个历史版本的区域都是这份；
+    已有 region_versions 行的版本（新库或已迁移）不受影响。
+    """
+    row = conn.execute("SELECT geojson FROM regions WHERE id = 1").fetchone()
+    if row is None:
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO region_versions (revision, geojson) "
+        "SELECT revision, ? FROM versions",
+        (row[0],),
+    )

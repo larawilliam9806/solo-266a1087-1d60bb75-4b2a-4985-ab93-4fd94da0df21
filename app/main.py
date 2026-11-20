@@ -1,10 +1,11 @@
-"""FastAPI 入口：版本化发布、整批替换、同版一致性查询。
+"""FastAPI 入口：版本化发布、整批替换、扩区拼接、同版一致性查询。
 
 并发与原子性：
 - 重活（几何核查、井归属重算）在写事务之外基于 base 版本快照完成；
 - 写事务用 BEGIN IMMEDIATE 串行化，进入后先核对 meta.current_revision
   仍等于 base_revision，不等则回滚返回 409 —— 同版并发修订只成功一份；
-- 版本行、宗地行、井归属行、版本指针在同一个事务里提交，失败/重启不留半版。
+- 版本行、区域行、宗地行、井归属行、版本指针在同一个事务里提交，
+  失败/重启不留半版；扩区的新范围、新宗地、新井与重算归属同版生效。
 """
 from __future__ import annotations
 
@@ -18,8 +19,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from .db import connect, init_db
-from .geo import attribute_wells, parse_point, parse_polygon, validate_tiling
-from .schemas import InitRequest, ReplaceRequest
+from .geo import (attribute_wells, parse_point, parse_polygon,
+                  polygon_to_geojson, validate_expansion, validate_tiling)
+from .schemas import MAX_PARCELS, MAX_WELLS, ExpandRequest, InitRequest, ReplaceRequest
 
 
 @asynccontextmanager
@@ -50,8 +52,12 @@ def _current_revision(conn: sqlite3.Connection) -> Optional[int]:
     return int(row[0]) if row is not None else None
 
 
-def _load_region(conn: sqlite3.Connection) -> dict:
-    row = conn.execute("SELECT geojson FROM regions WHERE id = 1").fetchone()
+def _load_region(conn: sqlite3.Connection, revision: int) -> dict:
+    """指定版本当时的监测范围（区域随扩区演进，按版本存取）。"""
+    row = conn.execute(
+        "SELECT geojson FROM region_versions WHERE revision = ?",
+        (revision,),
+    ).fetchone()
     return json.loads(row[0])
 
 
@@ -82,22 +88,27 @@ def _load_attributions(conn: sqlite3.Connection, revision: int) -> dict[str, dic
 
 def _insert_version(conn: sqlite3.Connection, revision: int,
                     parcels: dict[str, dict], attributions: dict[str, dict],
-                    region: Optional[dict], wells: Optional[dict[str, dict]]) -> None:
-    """在已开启的事务内写入一个完整版本（不含 meta 指针）。"""
+                    *, region: Optional[dict], wells: Optional[dict[str, dict]]) -> None:
+    """在已开启的事务内写入一个完整版本（不含 meta 指针）。
+
+    region 为该版本当时的监测范围；wells 为本次新登记的井（几何不可变，
+    只增不改）；该版本有哪些井由 attributions 的行集决定。
+    """
+    conn.execute(
+        "INSERT INTO versions (revision, created_at, parcel_count, well_count) "
+        "VALUES (?, ?, ?, ?)",
+        (revision, _now(), len(parcels), len(attributions)),
+    )
     if region is not None:
-        conn.execute("INSERT INTO regions (id, geojson) VALUES (1, ?)",
-                     (json.dumps(region),))
-    if wells is not None:
+        conn.execute(
+            "INSERT INTO region_versions (revision, geojson) VALUES (?, ?)",
+            (revision, json.dumps(region)),
+        )
+    if wells:
         conn.executemany(
             "INSERT INTO wells (well_id, geojson) VALUES (?, ?)",
             [(wid, json.dumps(g)) for wid, g in wells.items()],
         )
-    conn.execute(
-        "INSERT INTO versions (revision, created_at, parcel_count, well_count) "
-        "VALUES (?, ?, ?, ?)",
-        (revision, _now(), len(parcels),
-         len(wells) if wells is not None else len(attributions)),
-    )
     conn.executemany(
         "INSERT INTO parcels (revision, parcel_id, geojson) VALUES (?, ?, ?)",
         [(revision, pid, json.dumps(g)) for pid, g in parcels.items()],
@@ -130,9 +141,13 @@ def _well_summary(attributions: dict[str, dict]) -> dict:
     return summary
 
 
-def _parse_parcels(items, reasons: list[dict]) -> tuple[dict[str, Any], dict[str, dict]]:
+def _parse_parcels(items, reasons: list[dict],
+                   existing: Optional[dict] = None,
+                   ) -> tuple[dict[str, Any], dict[str, dict]]:
     """解析一批宗地几何，把重复编号与几何错误追加到 reasons。
 
+    existing 给出当前已存在的宗地（id -> geojson）：扩区时新宗地编号
+    与现有编号冲突也算 duplicate_parcel_id（合并后同类编号不得重复）。
     返回 (id -> shapely Polygon, id -> 原始 GeoJSON)。
     """
     geoms: dict[str, Any] = {}
@@ -142,11 +157,40 @@ def _parse_parcels(items, reasons: list[dict]) -> tuple[dict[str, Any], dict[str
             reasons.append({"code": "duplicate_parcel_id", "parcel_id": p.id,
                             "message": f"宗地编号 {p.id} 在请求中重复"})
             continue
+        if existing is not None and p.id in existing:
+            reasons.append({"code": "duplicate_parcel_id", "parcel_id": p.id,
+                            "message": f"宗地编号 {p.id} 与现有宗地重复，"
+                                       "合并后同类编号不得重复"})
+            continue
         geom, errs = parse_polygon(p.geometry, parcel_id=p.id, label=f"宗地 {p.id}")
         reasons.extend(errs)
         if geom is not None:
             geoms[p.id] = geom
             geojson_by_id[p.id] = p.geometry
+    return geoms, geojson_by_id
+
+
+def _parse_wells(items, reasons: list[dict],
+                 existing: Optional[dict] = None,
+                 ) -> tuple[dict[str, Any], dict[str, dict]]:
+    """解析一批井几何，规则同 _parse_parcels。返回 (id -> Point, id -> GeoJSON)。"""
+    geoms: dict[str, Any] = {}
+    geojson_by_id: dict[str, dict] = {}
+    for w in items:
+        if w.id in geojson_by_id:
+            reasons.append({"code": "duplicate_well_id", "well_id": w.id,
+                            "message": f"井编号 {w.id} 在请求中重复"})
+            continue
+        if existing is not None and w.id in existing:
+            reasons.append({"code": "duplicate_well_id", "well_id": w.id,
+                            "message": f"井编号 {w.id} 与现有井重复，"
+                                       "合并后同类编号不得重复"})
+            continue
+        geom, errs = parse_point(w.geometry, well_id=w.id, label=f"井 {w.id}")
+        reasons.extend(errs)
+        if geom is not None:
+            geoms[w.id] = geom
+            geojson_by_id[w.id] = w.geometry
     return geoms, geojson_by_id
 
 
@@ -160,19 +204,7 @@ def initialize(req: InitRequest):
     reasons.extend(errs)
 
     parcel_geoms, parcel_gj = _parse_parcels(req.parcels, reasons)
-
-    well_geoms: dict[str, Any] = {}
-    well_gj: dict[str, dict] = {}
-    for w in req.wells:
-        if w.id in well_gj:
-            reasons.append({"code": "duplicate_well_id", "well_id": w.id,
-                            "message": f"井编号 {w.id} 在请求中重复"})
-            continue
-        geom, errs = parse_point(w.geometry, well_id=w.id, label=f"井 {w.id}")
-        reasons.extend(errs)
-        if geom is not None:
-            well_geoms[w.id] = geom
-            well_gj[w.id] = w.geometry
+    well_geoms, well_gj = _parse_wells(req.wells, reasons)
 
     tiling = None
     if region_geom is not None and len(parcel_geoms) == len(req.parcels):
@@ -198,6 +230,9 @@ def initialize(req: InitRequest):
                                   "message": "数据集已完成首次提交，不能重复初始化"})
             _insert_version(conn, 1, parcel_gj, attributions,
                             region=req.region, wells=well_gj)
+            # legacy 初始区域记录：仅作为旧库迁移回填的来源保留。
+            conn.execute("INSERT INTO regions (id, geojson) VALUES (1, ?)",
+                         (json.dumps(req.region),))
             conn.execute("INSERT INTO meta (id, current_revision) VALUES (1, 1)")
             conn.execute("COMMIT")
         except Exception:
@@ -229,7 +264,7 @@ def replace_parcels(req: ReplaceRequest):
                 "current_revision": current,
                 "base_revision": req.base_revision,
             })
-        region_gj = _load_region(conn)
+        region_gj = _load_region(conn, current)
         old_parcel_gj = _load_parcels(conn, current)
         well_gj = _load_well_geoms(conn)
     finally:
@@ -297,7 +332,7 @@ def replace_parcels(req: ReplaceRequest):
                     "base_revision": req.base_revision,
                 })
             _insert_version(conn, new_revision, new_parcel_gj, attributions,
-                            region=None, wells=None)
+                            region=region_gj, wells=None)
             cur = conn.execute(
                 "UPDATE meta SET current_revision = ? WHERE id = 1 AND current_revision = ?",
                 (new_revision, req.base_revision),
@@ -318,12 +353,146 @@ def replace_parcels(req: ReplaceRequest):
             "well_count": len(well_gj), "well_summary": _well_summary(attributions)}
 
 
+# ---------------------------------------------------------------- 扩区
+
+@app.post("/v1/expand", status_code=201)
+def expand_region(req: ExpandRequest):
+    """扩区：邻区边界 + 邻区宗地 + 该区新井，与当前范围拼接后整体发布新版本。
+
+    新范围、合并后的宗地与新井、全量重算的井归属在同一事务里生效；
+    校验失败、基准过期或保存出错时本次扩区整批不生效。可多次提交。
+    """
+    # 1) 读取 base 版本快照（读路径不阻塞他人；最终闸门在写事务里）
+    conn = connect()
+    try:
+        current = _current_revision(conn)
+        if current is None:
+            return _err(404, {"error": "not_initialized",
+                              "message": "尚未首次提交，请先调用 POST /v1/init"})
+        if req.base_revision != current:
+            return _err(409, {
+                "error": "revision_conflict",
+                "message": f"所见修订号 {req.base_revision} 已过期，当前为 {current}，"
+                           "请重新读取后再提交",
+                "current_revision": current,
+                "base_revision": req.base_revision,
+            })
+        region_gj = _load_region(conn, current)
+        old_parcel_gj = _load_parcels(conn, current)
+        old_well_gj = _load_well_geoms(conn)
+    finally:
+        conn.close()
+
+    # 2) 解析与核查（重活都在写事务之外基于快照完成）
+    reasons: list[dict] = []
+    current_geom, _ = parse_polygon(region_gj, label="当前区域")
+    neighbor_geom, errs = parse_polygon(req.region, label="邻区")
+    reasons.extend(errs)
+
+    new_parcel_geoms, new_parcel_gj = _parse_parcels(req.parcels, reasons,
+                                                     existing=old_parcel_gj)
+    new_well_geoms, new_well_gj = _parse_wells(req.wells, reasons,
+                                               existing=old_well_gj)
+
+    # 合并后总量限制
+    total_parcels = len(old_parcel_gj) + len(new_parcel_gj)
+    total_wells = len(old_well_gj) + len(new_well_gj)
+    if total_parcels > MAX_PARCELS:
+        reasons.append({"code": "too_many_parcels",
+                        "message": f"合并后宗地共 {total_parcels} 块，"
+                                   f"超过上限 {MAX_PARCELS}"})
+    if total_wells > MAX_WELLS:
+        reasons.append({"code": "too_many_wells",
+                        "message": f"合并后井共 {total_wells} 口，超过上限 {MAX_WELLS}"})
+
+    # 邻区与当前区域：共边、内部不重叠、拼接后为无洞单环
+    merged_geom = None
+    if current_geom is not None and neighbor_geom is not None:
+        merged_geom, errs = validate_expansion(current_geom, neighbor_geom)
+        reasons.extend(errs)
+
+    # 邻区宗地按原有规则做覆盖核查
+    tiling = None
+    if neighbor_geom is not None and len(new_parcel_geoms) == len(req.parcels):
+        tiling = validate_tiling(new_parcel_geoms, neighbor_geom)
+        reasons.extend(tiling.reasons)
+
+    # 新井须落在邻区内或边界上
+    if neighbor_geom is not None:
+        for wid, pt in new_well_geoms.items():
+            if not neighbor_geom.intersects(pt):
+                reasons.append({"code": "well_outside_region", "well_id": wid,
+                                "message": f"井 {wid} 不在邻区内或邻区边界上"})
+    if reasons:
+        return _validation_error(
+            reasons,
+            gap_area=tiling.gap_area if tiling else None,
+            overlaps=tiling.overlaps if tiling else None,
+            overlap_parcel_ids=tiling.overlap_parcel_ids if tiling else None,
+        )
+
+    # 3) 合并集合，按拼接后的宗地全量重算归属（原外沿井同样列全候选）
+    old_geoms = {}
+    for pid, gj in old_parcel_gj.items():
+        geom, _ = parse_polygon(gj, parcel_id=pid, label=f"宗地 {pid}")
+        old_geoms[pid] = geom
+    old_well_geoms = {}
+    for wid, gj in old_well_gj.items():
+        geom, _ = parse_point(gj, well_id=wid, label=f"井 {wid}")
+        old_well_geoms[wid] = geom
+
+    merged_parcel_gj = {**old_parcel_gj, **new_parcel_gj}
+    attributions = attribute_wells({**old_well_geoms, **new_well_geoms},
+                                   {**old_geoms, **new_parcel_geoms})
+    merged_region_gj = polygon_to_geojson(merged_geom)
+
+    # 4) 乐观并发提交：同版并发扩区/改图只成功一份
+    new_revision = current + 1
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if _current_revision(conn) != req.base_revision:
+                conn.execute("ROLLBACK")
+                return _err(409, {
+                    "error": "revision_conflict",
+                    "message": "提交期间已有其他修订发布，本次扩区作废，请基于新版重试",
+                    "current_revision": _current_revision(conn),
+                    "base_revision": req.base_revision,
+                })
+            _insert_version(conn, new_revision, merged_parcel_gj, attributions,
+                            region=merged_region_gj, wells=new_well_gj)
+            cur = conn.execute(
+                "UPDATE meta SET current_revision = ? WHERE id = 1 AND current_revision = ?",
+                (new_revision, req.base_revision),
+            )
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                return _err(409, {"error": "revision_conflict",
+                                  "message": "版本指针已被其他修订更新",
+                                  "base_revision": req.base_revision})
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+    return {"revision": new_revision, "parcel_count": len(merged_parcel_gj),
+            "well_count": total_wells, "well_summary": _well_summary(attributions)}
+
+
 # ---------------------------------------------------------------- 查询
 
 def _wells_payload(well_gj: dict[str, dict], attributions: dict[str, dict]) -> list[dict]:
+    """该版本的井清单 + 归属。
+
+    井只增不改、几何存一份；某版本"当时有哪些井"由该版归属行集决定，
+    因此历史修订不会看到后来扩区才登记的井。
+    """
     return [
         {"id": wid, "geometry": well_gj[wid], **attributions[wid]}
-        for wid in sorted(well_gj)
+        for wid in sorted(attributions)
     ]
 
 
@@ -339,7 +508,7 @@ def get_current():
                 conn.execute("ROLLBACK")
                 return _err(404, {"error": "not_initialized",
                                   "message": "尚未首次提交"})
-            region = _load_region(conn)
+            region = _load_region(conn, revision)
             parcels = _load_parcels(conn, revision)
             well_gj = _load_well_geoms(conn)
             attributions = _load_attributions(conn, revision)
@@ -416,7 +585,7 @@ def get_revision(revision: int):
                 conn.execute("ROLLBACK")
                 return _err(404, {"error": "revision_not_found",
                                   "message": f"版本 {revision} 不存在"})
-            region = _load_region(conn)
+            region = _load_region(conn, revision)
             parcels = _load_parcels(conn, revision)
             well_gj = _load_well_geoms(conn)
             attributions = _load_attributions(conn, revision)

@@ -21,6 +21,7 @@ from shapely.ops import unary_union
 from shapely.validation import explain_validity
 
 AREA_TOL = 1e-6
+LENGTH_TOL = 1e-6
 
 
 # ---------------------------------------------------------------- 基础检查
@@ -181,6 +182,55 @@ def validate_tiling(parcels: dict[str, Polygon], region: Polygon) -> TilingRepor
         overlap_parcel_ids=overlap_ids,
         reasons=reasons,
     )
+
+
+# ---------------------------------------------------------------- 扩区拼接核查
+
+def validate_expansion(current: Polygon,
+                       neighbor: Polygon) -> tuple[Optional[Polygon], list[dict]]:
+    """核查邻区与当前区域的拼接关系，返回 (合并后的区域, reasons)。
+
+    规则：内部互不重叠；至少共一段边（仅共点不算）；拼接后是无洞单环区域。
+    """
+    reasons: list[dict] = []
+
+    inter_area = current.intersection(neighbor).area
+    if inter_area > AREA_TOL:
+        reasons.append(_err(
+            "region_overlap",
+            f"邻区与当前区域内部重叠 {inter_area:.6g} 平方单位",
+            area=round(inter_area, 6),
+        ))
+    shared_len = current.boundary.intersection(neighbor.boundary).length
+    if shared_len <= LENGTH_TOL:
+        reasons.append(_err(
+            "no_shared_edge",
+            "邻区与当前区域没有公共边（仅共点或相离），无法拼接",
+        ))
+    if reasons:
+        return None, reasons
+
+    merged = unary_union([current, neighbor])
+    if merged.geom_type != "Polygon":
+        reasons.append(_err("merged_region_invalid", "拼接后的范围不是单环区域"))
+        return None, reasons
+    if len(merged.interiors) > 0:
+        reasons.append(_err("merged_region_invalid",
+                            "拼接后的范围带洞，须为无洞单环区域"))
+        return None, reasons
+    return merged, []
+
+
+def _coord(v: float) -> Any:
+    """整数顶点归一为 int，保持"边界整数坐标"的存储规则。"""
+    r = round(v)
+    return int(r) if abs(v - r) < 1e-9 else v
+
+
+def polygon_to_geojson(poly: Polygon) -> dict:
+    """把合并后的区域转回无洞 GeoJSON Polygon（外环，整数坐标归一）。"""
+    ring = [[_coord(x), _coord(y)] for x, y in poly.exterior.coords]
+    return {"type": "Polygon", "coordinates": [ring]}
 
 
 # ---------------------------------------------------------------- 井归属
